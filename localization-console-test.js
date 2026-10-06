@@ -239,15 +239,25 @@
             total: keys.length,
             current: 0,
             reviewed: [],
+            stopRequested: false,
             close: null
         };
         window.__localizationPopupRun = run;
         localization.language = report.language;
         localization._data_index = strings;
+        window.stopLocalizationPopupReview = () => {
+            if (!run.active) return false;
+            run.stopRequested = true;
+            window.Ext?.Msg?.hide();
+            run.close?.();
+            return true;
+        };
 
 
         try {
             for (const key of keys) {
+                if (run.stopRequested) break;
+
                 run.current++;
                 const text = strings[key];
                 const placeholders = [...new Set(
@@ -269,7 +279,7 @@
                     const finish = () => {
                         if (settled) return;
                         settled = true;
-                        run.reviewed.push(key);
+                        if (!run.stopRequested) run.reviewed.push(key);
                         resolve();
                     };
                     run.close = finish;
@@ -281,11 +291,13 @@
             localization._data_index = previous.data;
             run.active = false;
             run.close = null;
+            delete window.stopLocalizationPopupReview;
         }
 
 
         console.log(
-            `[Localization popup review] Complete: ${run.reviewed.length}/${run.total} ` +
+            `[Localization popup review] ${run.stopRequested ? "Stopped" : "Complete"}: ` +
+            `${run.reviewed.length}/${run.total} ` +
             `${report.language} non-translated entries reviewed.`
         );
         return run;
