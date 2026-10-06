@@ -8,6 +8,7 @@
     };
     const REVIEW_STATUSES = new Set(["pass", "fail", "blocked", "needs-review"]);
     const languageLoads = new Map();
+    let localizationSheet = null;
 
     function getLocalization() {
         const localization = window.MyApp?.libs?.Localization;
@@ -120,6 +121,281 @@
         return [...new Set(
             Array.from(text.matchAll(/\{([A-Za-z0-9_]+)\}/g), match => match[1])
         )].sort();
+    }
+
+    function parseCsvRows(text) {
+        const rows = [];
+        let row = [];
+        let cell = "";
+        let quoted = false;
+
+        for (let index = 0; index < text.length; index++) {
+            const character = text[index];
+            if (quoted) {
+                if (character === '"' && text[index + 1] === '"') {
+                    cell += '"';
+                    index++;
+                } else if (character === '"') {
+                    quoted = false;
+                } else {
+                    cell += character;
+                }
+            } else if (character === '"' && cell.length === 0) {
+                quoted = true;
+            } else if (character === ",") {
+                row.push(cell);
+                cell = "";
+            } else if (character === "\n" || character === "\r") {
+                row.push(cell);
+                if (row.some(value => value !== "")) rows.push(row);
+                row = [];
+                cell = "";
+                if (character === "\r" && text[index + 1] === "\n") index++;
+            } else {
+                cell += character;
+            }
+        }
+        if (quoted) throw new Error("The CSV file has an unterminated quoted cell.");
+        row.push(cell);
+        if (row.some(value => value !== "")) rows.push(row);
+        if (rows.length === 0) throw new Error("The selected CSV file is empty.");
+        return rows;
+    }
+
+    async function readZipEntries(buffer) {
+        const bytes = new Uint8Array(buffer);
+        const view = new DataView(buffer);
+        const decoder = new TextDecoder();
+        let endRecord = -1;
+        for (let offset = Math.max(0, bytes.length - 65557); offset <= bytes.length - 22; offset++) {
+            if (view.getUint32(offset, true) === 0x06054b50) endRecord = offset;
+        }
+        if (endRecord < 0) throw new Error("The Excel file is not a valid .xlsx workbook.");
+
+        const entryCount = view.getUint16(endRecord + 10, true);
+        let directoryOffset = view.getUint32(endRecord + 16, true);
+        const entries = new Map();
+        for (let index = 0; index < entryCount; index++) {
+            if (view.getUint32(directoryOffset, true) !== 0x02014b50) {
+                throw new Error("The Excel workbook's ZIP directory is invalid.");
+            }
+            const method = view.getUint16(directoryOffset + 10, true);
+            const compressedSize = view.getUint32(directoryOffset + 20, true);
+            const nameLength = view.getUint16(directoryOffset + 28, true);
+            const extraLength = view.getUint16(directoryOffset + 30, true);
+            const commentLength = view.getUint16(directoryOffset + 32, true);
+            const localOffset = view.getUint32(directoryOffset + 42, true);
+            const name = decoder.decode(bytes.subarray(
+                directoryOffset + 46,
+                directoryOffset + 46 + nameLength
+            ));
+            const localNameLength = view.getUint16(localOffset + 26, true);
+            const localExtraLength = view.getUint16(localOffset + 28, true);
+            const dataOffset = localOffset + 30 + localNameLength + localExtraLength;
+            const compressed = bytes.slice(dataOffset, dataOffset + compressedSize);
+            let content;
+
+            if (method === 0) {
+                content = compressed;
+            } else if (method === 8 && typeof DecompressionStream === "function") {
+                try {
+                    const stream = new Blob([compressed])
+                        .stream()
+                        .pipeThrough(new DecompressionStream("deflate-raw"));
+                    content = new Uint8Array(await new Response(stream).arrayBuffer());
+                } catch (error) {
+                    throw new Error(`Could not decompress Excel workbook entry "${name}": ${error.message}`);
+                }
+            } else {
+                throw new Error(
+                    `Excel workbook compression method ${method} is not supported for "${name}".`
+                );
+            }
+            entries.set(name, content);
+            directoryOffset += 46 + nameLength + extraLength + commentLength;
+        }
+        return entries;
+    }
+
+    function parseXlsxXml(bytes, partName) {
+        if (!bytes) throw new Error(`The Excel workbook is missing ${partName}.`);
+        const document = new DOMParser().parseFromString(new TextDecoder().decode(bytes), "application/xml");
+        if (document.querySelector("parsererror")) {
+            throw new Error(`Could not read ${partName} in the Excel workbook.`);
+        }
+        return document;
+    }
+
+    function resolveWorkbookPart(target) {
+        const parts = target.startsWith("/") ? [] : ["xl"];
+        for (const part of target.replace(/^\/+/, "").split("/")) {
+            if (!part || part === ".") continue;
+            if (part === "..") parts.pop();
+            else parts.push(part);
+        }
+        return parts.join("/");
+    }
+
+    async function parseXlsxSheets(buffer) {
+        const parts = await readZipEntries(buffer);
+        const sharedStrings = [];
+        if (parts.has("xl/sharedStrings.xml")) {
+            const sharedDocument = parseXlsxXml(parts.get("xl/sharedStrings.xml"), "xl/sharedStrings.xml");
+            for (const item of sharedDocument.getElementsByTagNameNS("*", "si")) {
+                sharedStrings.push(
+                    [...item.getElementsByTagNameNS("*", "t")]
+                        .map(node => node.textContent || "")
+                        .join("")
+                );
+            }
+        }
+
+        const workbook = parseXlsxXml(parts.get("xl/workbook.xml"), "xl/workbook.xml");
+        const relationships = parseXlsxXml(
+            parts.get("xl/_rels/workbook.xml.rels"),
+            "xl/_rels/workbook.xml.rels"
+        );
+        const targets = new Map(
+            [...relationships.getElementsByTagNameNS("*", "Relationship")]
+                .map(relation => [relation.getAttribute("Id"), relation.getAttribute("Target")])
+        );
+        const sheets = [];
+        for (const sheet of workbook.getElementsByTagNameNS("*", "sheet")) {
+            const relationId = sheet.getAttributeNS(
+                "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+                "id"
+            ) || sheet.getAttribute("r:id");
+            const target = targets.get(relationId);
+            if (!target) throw new Error(`Could not locate Excel worksheet "${sheet.getAttribute("name")}".`);
+            const partName = resolveWorkbookPart(target);
+            const worksheet = parseXlsxXml(parts.get(partName), partName);
+            const rows = [];
+
+            for (const rowNode of worksheet.getElementsByTagNameNS("*", "row")) {
+                const row = [];
+                for (const cellNode of rowNode.getElementsByTagNameNS("*", "c")) {
+                    const reference = cellNode.getAttribute("r");
+                    const columnName = reference.replace(/[0-9]/g, "");
+                    let column = 0;
+                    for (const character of columnName) {
+                        column = column * 26 + character.toUpperCase().charCodeAt(0) - 64;
+                    }
+                    column--;
+                    const type = cellNode.getAttribute("t");
+                    const valueNode = cellNode.getElementsByTagNameNS("*", "v")[0];
+                    const inlineNode = cellNode.getElementsByTagNameNS("*", "is")[0];
+                    let value = valueNode?.textContent || "";
+                    if (type === "s" && value !== "") {
+                        value = sharedStrings[Number(value)] ?? "";
+                    } else if (type === "inlineStr" && inlineNode) {
+                        value = [...inlineNode.getElementsByTagNameNS("*", "t")]
+                            .map(node => node.textContent || "")
+                            .join("");
+                    }
+                    row[column] = value;
+                }
+                rows.push(row.map(value => value ?? ""));
+            }
+            sheets.push({ name: sheet.getAttribute("name") || "", rows });
+        }
+        if (sheets.length === 0) throw new Error("The Excel workbook has no worksheets.");
+        return sheets;
+    }
+
+    async function parseLocalizationSheet(file) {
+        if (!file || typeof file.name !== "string") {
+            throw new Error("Select a CSV or Excel .xlsx localization sheet.");
+        }
+        const extension = file.name.toLowerCase().split(".").pop();
+        let sheets;
+        if (extension === "csv") {
+            if (typeof file.text !== "function") throw new Error("Could not read the selected CSV file.");
+            sheets = [{ name: "", rows: parseCsvRows((await file.text()).replace(/^\uFEFF/, "")) }];
+        } else if (extension === "xlsx") {
+            if (typeof file.arrayBuffer !== "function") throw new Error("Could not read the selected Excel file.");
+            sheets = await parseXlsxSheets(await file.arrayBuffer());
+        } else {
+            throw new Error("Unsupported sheet format. Choose a .csv or .xlsx file.");
+        }
+        if (sheets.some(sheet => sheet.rows.length === 0)) {
+            throw new Error("The selected localization sheet contains an empty worksheet.");
+        }
+        return { name: file.name, sheets };
+    }
+
+    function normalizeSheetHeader(value) {
+        return String(value || "")
+            .trim()
+            .toLowerCase()
+            .replace(/\s*(translation|translations|text|value)\s*$/, "")
+            .replace(/[^a-z0-9]/g, "");
+    }
+
+    function getExpectedSheetEntries(sheet, languageName) {
+        if (!sheet) return null;
+        const languageInfo = findLanguageInfo(getAvailableLanguages(), languageName);
+        const languageHeaders = new Set(
+            [languageName, languageInfo?.name, languageInfo?.displayName, languageInfo?.code]
+                .filter(Boolean)
+                .map(normalizeSheetHeader)
+        );
+        const keyHeaders = new Set([
+            "key",
+            "keys",
+            "localizationkey",
+            "translationkey",
+            "barekey",
+            "fullkey",
+            "fullpathkey",
+            "pathkey"
+        ]);
+        const entries = new Map();
+        let matchedLanguage = false;
+
+        for (const worksheet of sheet.sheets) {
+            let headerRow = -1;
+            let keyColumn = -1;
+            let fullKeyColumn = -1;
+            let languageColumn = -1;
+            const scanLimit = Math.min(worksheet.rows.length, 15);
+            for (let rowIndex = 0; rowIndex < scanLimit && headerRow < 0; rowIndex++) {
+                const normalized = worksheet.rows[rowIndex].map(normalizeSheetHeader);
+                const langIndex = normalized.findIndex(value => languageHeaders.has(value));
+                const keyIndex = normalized.findIndex(value => keyHeaders.has(value));
+                if (langIndex >= 0 && keyIndex >= 0) {
+                    headerRow = rowIndex;
+                    keyColumn = keyIndex;
+                    fullKeyColumn = normalized.findIndex(value =>
+                        value === "fullkey" || value === "fullpathkey" || value === "pathkey"
+                    );
+                    languageColumn = langIndex;
+                }
+            }
+            if (headerRow < 0) continue;
+            matchedLanguage = true;
+
+            for (const row of worksheet.rows.slice(headerRow + 1)) {
+                const rawKey = String(row[fullKeyColumn >= 0 ? fullKeyColumn : keyColumn] || "").trim();
+                if (!rawKey) continue;
+                const key = rawKey.includes("/") || !worksheet.name
+                    ? rawKey
+                    : `${worksheet.name}/${rawKey}`;
+                const expected = String(row[languageColumn] ?? "");
+                if (entries.has(key) && entries.get(key) !== expected) {
+                    throw new Error(`The sheet contains conflicting translations for "${key}".`);
+                }
+                entries.set(key, expected);
+            }
+        }
+        if (!matchedLanguage) {
+            throw new Error(
+                `No sheet header was found for ${languageName}. Include a key column and a "${languageName}" translation column.`
+            );
+        }
+        if (entries.size === 0) {
+            throw new Error(`The sheet has no localization keys for ${languageName}.`);
+        }
+        return entries;
     }
 
     function formatText(text, names) {
@@ -289,6 +565,105 @@
         };
     }
 
+    function buildCodeFetchAudit(languageName, strings, baselineLanguage) {
+        const localization = getLocalization();
+        const english = baselineLanguage ? window.languageData?.[baselineLanguage] : null;
+        const hasBaseline = !!english && typeof english === "object" && !Array.isArray(english);
+        const failures = [];
+        const translate = window.$$?.translate;
+
+        if (!localizationSheet) {
+            return {
+                status: "blocked",
+                keysTested: 0,
+                passed: 0,
+                failed: 0,
+                failures: [],
+                error: "Upload a CSV or Excel .xlsx localization sheet before testing code fetching."
+            };
+        }
+
+        let expectedEntries;
+        try {
+            expectedEntries = getExpectedSheetEntries(localizationSheet, languageName);
+        } catch (error) {
+            return {
+                status: "blocked",
+                keysTested: 0,
+                passed: 0,
+                failed: 0,
+                failures: [],
+                sheetFile: localizationSheet.name,
+                error: error?.message || String(error)
+            };
+        }
+
+        if (typeof translate !== "function") {
+            return {
+                status: "blocked",
+                keysTested: 0,
+                passed: 0,
+                failed: 0,
+                failures: [],
+                sheetFile: localizationSheet.name,
+                error: "The game's code-facing translation API is unavailable: $$.translate is not a function."
+            };
+        }
+
+        const keys = [...expectedEntries.keys()].sort();
+        const previous = {
+            language: localization.language,
+            data: localization._data_index
+        };
+        try {
+            localization.language = languageName;
+            localization._data_index = strings;
+            for (const key of keys) {
+                const englishValue = hasBaseline ? english[key] : undefined;
+                const fallback = typeof englishValue === "string"
+                    ? englishValue
+                    : `[LOCALIZATION_QA_DEFAULT:${key}]`;
+                const sheetValue = expectedEntries.get(key);
+                const expected = sheetValue.trim() === "" ? fallback : sheetValue;
+
+                try {
+                    const actual = translate(key, fallback);
+                    if (actual !== expected) {
+                        const actualDescription = typeof actual === "string"
+                            ? JSON.stringify(actual)
+                            : `<${typeof actual}>`;
+                        failures.push({
+                            key,
+                            expected,
+                            actual,
+                            issue: `$$.translate returned ${actualDescription}; expected ${JSON.stringify(expected)}.`
+                        });
+                    }
+                } catch (error) {
+                    failures.push({
+                        key,
+                        expected,
+                        issue: `$$.translate threw: ${error?.message || String(error)}.`
+                    });
+                }
+            }
+        } finally {
+            localization.language = previous.language;
+            localization._data_index = previous.data;
+        }
+
+        return {
+            status: failures.length > 0 ? "fail" : hasBaseline ? "pass" : "incomplete",
+            keysTested: keys.length,
+            passed: keys.length - failures.length,
+            failed: failures.length,
+            failures,
+            hasEnglishBaseline: hasBaseline,
+            comparisonSource: "uploaded-sheet",
+            sheetFile: localizationSheet.name
+        };
+    }
+
     function printAudit(report) {
         const status = report.auditStatus === "fail"
             ? "FAIL"
@@ -299,7 +674,10 @@
                 : "PASS";
         console.log(
             `[Localization QA] ${status} — ${report.language}: ` +
-            `${report.passed}/${report.totalKeys} keys clear, ${report.failed} failures, ` +
+            `${report.codeFetchAudit.sheetFile ? `sheet ${report.codeFetchAudit.sheetFile}; ` : ""}` +
+            `${report.passed}/${report.totalKeys} dictionary keys clear, ${report.failed} dictionary failures, ` +
+            `${report.codeFetchAudit.passed}/${report.codeFetchAudit.keysTested} code-fetch keys passed, ` +
+            `${report.codeFetchAudit.failed} code-fetch failures, ` +
             `${report.warningCount} items for manual review; ` +
             `${report.missingKeys.length} missing, ${report.extraKeys.length} extra, ` +
             `${report.emptyTranslations.length} empty, ${report.unchangedTranslations.length} unchanged, ` +
@@ -319,6 +697,22 @@
             })));
             if (report.failures.length > 50) {
                 console.warn(`[Localization QA] ${report.failures.length - 50} more issue rows omitted from the table.`);
+            }
+        }
+        if (report.codeFetchAudit.error) {
+            console.warn(`[Localization QA] Code-fetch test blocked: ${report.codeFetchAudit.error}`);
+        }
+        if (report.codeFetchAudit.failures.length > 0) {
+            console.table(report.codeFetchAudit.failures.slice(0, 50).map(failure => ({
+                key: failure.key,
+                expected: failure.expected,
+                actual: failure.actual,
+                issue: failure.issue
+            })));
+            if (report.codeFetchAudit.failures.length > 50) {
+                console.warn(
+                    `[Localization QA] ${report.codeFetchAudit.failures.length - 50} more code-fetch issue rows omitted from the table.`
+                );
             }
         }
         if (report.warnings.length > 0) {
@@ -389,6 +783,12 @@
                 }
             }
             const report = buildAudit(languageName, strings, baselineLanguage, baselineWarning);
+            report.codeFetchAudit = buildCodeFetchAudit(languageName, strings, baselineLanguage);
+            if (report.codeFetchAudit.status === "fail") {
+                report.auditStatus = "fail";
+            } else if (report.codeFetchAudit.status !== "pass" && report.auditStatus !== "fail") {
+                report.auditStatus = "incomplete";
+            }
             saveLatestAudit(report, strings);
             return options.quiet ? report : printAudit(report);
         } catch (error) {
@@ -402,6 +802,51 @@
             if (!options.quiet) console.error("[Localization QA] BLOCKED:", report.error);
             return report;
         }
+    };
+
+    window.loadLocalizationSheet = async function loadLocalizationSheet(
+        file,
+        requestedLanguage = getDefaultLocalizationLanguage()
+    ) {
+        const parsed = await parseLocalizationSheet(file);
+        const entries = getExpectedSheetEntries(parsed, requestedLanguage);
+        localizationSheet = parsed;
+        return {
+            name: parsed.name,
+            worksheets: parsed.sheets.length,
+            rows: parsed.sheets.reduce((total, worksheet) => total + worksheet.rows.length, 0),
+            keys: entries.size,
+            language: requestedLanguage
+        };
+    };
+
+    window.runLocalizationCodeFetchTest = async function runLocalizationCodeFetchTest(
+        requestedLanguage = getDefaultLocalizationLanguage()
+    ) {
+        if (!localizationSheet) {
+            throw new Error("Upload a CSV or Excel .xlsx localization sheet before testing code fetching.");
+        }
+        const report = await window.runLocalizationChecks(requestedLanguage, { quiet: true });
+        if (!report.ready) throw new Error(report.error);
+
+        const result = report.codeFetchAudit;
+        console.log(
+            `[Localization QA] Code-fetch ${result.status.toUpperCase()} — ${report.language}: ` +
+            `${result.sheetFile ? `sheet ${result.sheetFile}; ` : ""}` +
+            `${result.passed}/${result.keysTested} keys passed, ${result.failed} failures.`
+        );
+        if (result.error) {
+            console.warn(`[Localization QA] ${result.error}`);
+        }
+        if (result.failures.length > 0) {
+            console.table(result.failures.slice(0, 50));
+            if (result.failures.length > 50) {
+                console.warn(
+                    `[Localization QA] ${result.failures.length - 50} more code-fetch failures are in the returned result.`
+                );
+            }
+        }
+        return result;
     };
 
     window.listLocalizationLanguages = function listLocalizationLanguages() {
@@ -1018,6 +1463,7 @@
         const actions = createPanelElement("div", undefined, panel);
         actions.className = "lqa-grid";
         const auditButton = createPanelElement("button", "Run audit", actions);
+        const codeFetchButton = createPanelElement("button", "Test code fetching", actions);
         const foldersButton = createPanelElement("button", "Refresh folders", actions);
         const folderReviewButton = createPanelElement("button", "Review folder", actions);
         const allReviewButton = createPanelElement("button", "Review all keys", actions);
@@ -1025,10 +1471,17 @@
         const stopButton = createPanelElement("button", "Stop review", actions);
         stopButton.disabled = true;
 
-        const status = createPanelElement("div", "Ready. Run an audit to begin.", panel);
+        const status = createPanelElement("div", "Upload a translation sheet, choose its language, then test code fetching.", panel);
         status.className = "lqa-status";
         status.setAttribute("role", "status");
         status.setAttribute("aria-live", "polite");
+
+        createPanelElement("label", "Reference sheet (CSV or Excel .xlsx)", panel).className = "lqa-label";
+        const sheetInput = createPanelElement("input", undefined, panel);
+        sheetInput.type = "file";
+        sheetInput.accept = ".csv,.xlsx,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+        sheetInput.setAttribute("aria-label", "Localization reference sheet");
+        sheetInput.style.cssText = "display:block;width:100%;min-height:48px;color:#e2e8f0;";
 
         const findingsDetails = createPanelElement("details", undefined, panel);
         const findingsSummary = createPanelElement("summary", "Audit findings", findingsDetails);
@@ -1073,6 +1526,16 @@
                     text: failure.issues.join(" | "),
                     kind: "FAIL"
                 })),
+                ...report.codeFetchAudit.failures.map(failure => ({
+                    key: failure.key,
+                    text: failure.issue,
+                    kind: "CODE FETCH FAIL"
+                })),
+                ...(report.codeFetchAudit.error ? [{
+                    key: report.codeFetchAudit.sheetFile || "Reference sheet",
+                    text: report.codeFetchAudit.error,
+                    kind: "CODE FETCH BLOCKED"
+                }] : []),
                 ...report.warnings.map(warning => ({
                     key: warning.key,
                     text: warning.issue,
@@ -1080,7 +1543,8 @@
                 }))
             ];
             findingsSummary.textContent = entries.length
-                ? `Audit findings (${report.failed} failures, ${report.warningCount} for review)`
+                ? `Audit findings (${report.failed} dictionary failures, ` +
+                    `${report.codeFetchAudit.failed} code-fetch failures, ${report.warningCount} for review)`
                 : `Audit findings (${report.auditStatus.toUpperCase()})`;
             for (const finding of entries.slice(0, 100)) {
                 const item = createPanelElement(
@@ -1101,6 +1565,16 @@
             findingsDetails.open = entries.length > 0;
         };
         const selectedLanguage = () => languageSelect.value || getDefaultLocalizationLanguage();
+        sheetInput.addEventListener("change", () => runAction(async () => {
+            const file = sheetInput.files?.[0];
+            if (!file) return;
+            const result = await window.loadLocalizationSheet(file, selectedLanguage());
+            announce(
+                `Loaded ${result.name}: ${result.keys} expected ${result.language} keys from ` +
+                `${result.worksheets} worksheet${result.worksheets === 1 ? "" : "s"}.`,
+                "success"
+            );
+        }));
         const refreshFolders = async () => {
             const listing = await window.listLocalizationPopupFolders(selectedLanguage());
             folderSelect.replaceChildren();
@@ -1143,7 +1617,8 @@
                     ? "success"
                     : "info";
             announce(
-                `${report.auditStatus.toUpperCase()}: ${report.failed} failures, ` +
+                `${report.auditStatus.toUpperCase()}: ${report.failed} dictionary failures, ` +
+                `${report.codeFetchAudit.failed} code-fetch failures, ` +
                 `${report.warningCount} warnings. Loading folders...`,
                 kind
             );
@@ -1188,6 +1663,14 @@
             });
         });
         auditButton.addEventListener("click", () => runAction(audit));
+        codeFetchButton.addEventListener("click", () => runAction(async () => {
+            const result = await window.runLocalizationCodeFetchTest(selectedLanguage());
+            announce(
+                `Code-fetch ${result.status.toUpperCase()}: ${result.passed}/${result.keysTested} keys passed, ` +
+                `${result.failed} failures${result.sheetFile ? ` (${result.sheetFile})` : ""}.`,
+                result.status === "pass" ? "success" : result.status === "fail" ? "error" : "info"
+            );
+        }));
         foldersButton.addEventListener("click", () => runAction(refreshFolders));
         folderReviewButton.addEventListener("click", () => runAction(async () => {
             if (!folderSelect.value) throw new Error("Select a folder first.");
@@ -1254,11 +1737,13 @@
         window.__localizationQAPanelWindow = childWindow;
         window.__localizationQAPanelControls = {
             languageSelect,
+            sheetInput,
             folderSelect,
             status,
             note,
             hideButton: closeButton,
             auditButton,
+            codeFetchButton,
             foldersButton,
             folderReviewButton,
             allReviewButton,

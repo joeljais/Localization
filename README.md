@@ -15,7 +15,7 @@ These scripts run inside the game's browser context; they are not a standalone a
 
 - Open the game in a browser and wait for its application scripts to finish loading.
 - The game page must expose `MyApp.libs.Localization`, `languageData`, `$$.formatStr`, and `$$.alert`.
-- The page must be able to load its language scripts. A dictionary not already loaded is requested from `app/resources/languages/lang_<LanguageName>.js` relative to the current game URL.
+- The page must be able to load its language scripts. A dictionary not already loaded is requested from `app/resources/languages/lang_<LanguageName>.js` relative to the current game URL. XLSX upload uses browser `DOMParser` and `DecompressionStream` support.
 - Run these scripts only on the game or an authorized test environment.
 
 ## Quick start: recommended QA flow
@@ -23,10 +23,11 @@ These scripts run inside the game's browser context; they are not a standalone a
 1. Open the game's browser developer console.
 2. Paste the full contents of `localization-console-test.js`. It adds a persistent **Open Localization QA** button to the game page and tries to open the QA controls in a separate browser window. If the browser blocks the window, allow pop-ups for the game and click the launcher, or run `window.showLocalizationQAPanel()`.
 3. In the QA window, choose a supported language from **Language**. To verify the available choices in the console, use `window.listLocalizationLanguages()`. Do not assume a language exists: options depend on the game build.
-4. Click **Run audit**. For non-English languages, the utility attempts to load English as the baseline and reports missing/extra keys, empty/unchanged strings, placeholder mismatches, formatter errors, and any baseline-loading problem.
-5. Choose a folder from the **Folder** list and click **Review folder**. Use **Review all keys** or **Review flagged keys** for those workflows. The panel shows current key and progress as one game popup opens at a time.
-6. While the current popup is visible, use the panel's **Pass**, **Fail**, **Blocked**, or **Needs review** buttons. Add an optional QA note first if helpful. Recording a verdict does not close the game popup; close it to advance to the next key. Merely viewing or closing a popup does not mark it as passed.
-7. Click **QA summary** to see review coverage, or **Download report** to export the automated and manual results as JSON. Manual verdicts live in the current page session, so download the report before reloading or closing the game.
+4. Select your reference sheet under **Reference sheet**. The panel accepts `.xlsx` workbooks and `.csv` files. It accepts the supplied workbook layout: worksheet tabs as key namespaces, a `Keys` column, and language columns such as `German`. More generally, each worksheet/CSV needs a `Key`, `Keys`, or `Full Path Key` column and a translation column headed with the selected language name or code (for example, `German` or `de`). Workbook tabs are treated as key namespaces for bare keys; CSV keys should include the full path, such as `General/Loading Msg`.
+5. Click **Test code fetching** to compare every row for the selected language against the live `$$.translate(key, defaultValue)` result, or **Run audit** to run that sheet comparison together with the dictionary audit. Blank expected sheet cells are checked against the in-code English fallback. Results name the uploaded sheet and report per-key mismatches. The game’s original language and dictionary are restored after testing.
+6. Choose a folder from the **Folder** list and click **Review folder**. Use **Review all keys** or **Review flagged keys** for those workflows. The panel shows current key and progress as one game popup opens at a time.
+7. While the current popup is visible, use the panel's **Pass**, **Fail**, **Blocked**, or **Needs review** buttons. Add an optional QA note first if helpful. Recording a verdict does not close the game popup; close it to advance to the next key. Merely viewing or closing a popup does not mark it as passed.
+8. Click **QA summary** to see review coverage, or **Download report** to export the automated and manual results as JSON. Manual verdicts live in the current page session, so download the report before reloading or closing the game.
 
 The separate QA window adapts to narrow/mobile screens with larger touch targets. On mobile browsers it may open as a separate tab. Keep the game page open while using the QA window because the localization APIs and review popups run in the game tab. The persistent game-page launcher can reopen the QA window at any time. **Hide window** closes only the QA window; it does not stop an active review or remove the launcher. **Stop review** closes the current review popup and restores the game's original language/dictionary. Reopen the QA window by clicking **Open Localization QA** or running `window.showLocalizationQAPanel()`. The console API remains available for scripted workflows.
 
@@ -55,7 +56,15 @@ Review a folder once without changing the selected language:
 await window.showLocalizationFolderPopups("German", "DynaConfMisc");
 ```
 
-Run or repeat only the automated audit:
+The console helper can load a browser `File` selected by the user, then run only the uploaded-sheet check:
+
+```js
+const file = window.__localizationQAPanelControls.sheetInput.files[0];
+await window.loadLocalizationSheet(file, "German");
+await window.runLocalizationCodeFetchTest("German");
+```
+
+Run or repeat the full automated audit (requires a reference sheet for the code-fetch check):
 
 ```js
 const report = await window.runLocalizationChecks();

@@ -2,12 +2,136 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const test = require("node:test");
+const { TextDecoder } = require("node:util");
+const zlib = require("node:zlib");
 const vm = require("node:vm");
 
 const source = fs.readFileSync(
     path.join(__dirname, "localization-console-test.js"),
     "utf8"
 );
+
+class XmlNode {
+    constructor(name, attributes = {}) {
+        this.name = name;
+        this.attributes = attributes;
+        this.children = [];
+        this.text = "";
+    }
+    get localName() {
+        return this.name.split(":").pop();
+    }
+    get textContent() {
+        return this.text + this.children.map(child => child.textContent).join("");
+    }
+    getAttribute(name) {
+        return this.attributes[name] || "";
+    }
+    getAttributeNS(_namespace, name) {
+        return this.getAttribute(`r:${name}`);
+    }
+    getElementsByTagNameNS(_namespace, name) {
+        const matches = [];
+        const visit = node => {
+            for (const child of node.children) {
+                if (child.localName === name) matches.push(child);
+                visit(child);
+            }
+        };
+        visit(this);
+        return matches;
+    }
+    querySelector(selector) {
+        return selector === "parsererror" ? null : undefined;
+    }
+}
+
+class TestDOMParser {
+    parseFromString(xml) {
+        const document = new XmlNode("#document");
+        const stack = [document];
+        const tokens = xml.match(/<!--[\s\S]*?-->|<\?[^>]*\?>|<![^>]*>|<\/[^>]+>|<[^>]+>|[^<]+/g) || [];
+        for (const token of tokens) {
+            if (token.startsWith("<!--") || token.startsWith("<?") || token.startsWith("<!")) continue;
+            if (token.startsWith("</")) {
+                stack.pop();
+            } else if (token.startsWith("<")) {
+                const name = /^<([^\s/>]+)/.exec(token)?.[1];
+                if (!name) continue;
+                const attributes = {};
+                const attributeSource = token.slice(name.length + 1, token.length - 1);
+                for (const match of attributeSource.matchAll(/([^\s=]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g)) {
+                    attributes[match[1]] = match[2] ?? match[3] ?? "";
+                }
+                const node = new XmlNode(name, attributes);
+                stack.at(-1).children.push(node);
+                if (!token.endsWith("/>")) stack.push(node);
+            } else {
+                stack.at(-1).text += token
+                    .replace(/&amp;/g, "&")
+                    .replace(/&lt;/g, "<")
+                    .replace(/&gt;/g, ">")
+                    .replace(/&quot;/g, "\"")
+                    .replace(/&apos;/g, "'");
+            }
+        }
+        return document;
+    }
+}
+
+function makeZip(files, method = 0) {
+    const localParts = [];
+    const centralParts = [];
+    let localOffset = 0;
+
+    for (const [name, content] of Object.entries(files)) {
+        const nameBytes = Buffer.from(name);
+        const data = Buffer.from(content);
+        const compressed = method === 8 ? zlib.deflateRawSync(data) : data;
+        const local = Buffer.alloc(30);
+        local.writeUInt32LE(0x04034b50, 0);
+        local.writeUInt16LE(20, 4);
+        local.writeUInt32LE(0, 6);
+        local.writeUInt16LE(method, 8);
+        local.writeUInt32LE(0, 14);
+        local.writeUInt32LE(compressed.length, 18);
+        local.writeUInt32LE(data.length, 22);
+        local.writeUInt16LE(nameBytes.length, 26);
+        local.writeUInt16LE(0, 28);
+        localParts.push(local, nameBytes, compressed);
+
+        const central = Buffer.alloc(46);
+        central.writeUInt32LE(0x02014b50, 0);
+        central.writeUInt16LE(20, 4);
+        central.writeUInt16LE(20, 6);
+        central.writeUInt32LE(0, 8);
+        central.writeUInt16LE(method, 10);
+        central.writeUInt32LE(0, 16);
+        central.writeUInt32LE(compressed.length, 20);
+        central.writeUInt32LE(data.length, 24);
+        central.writeUInt16LE(nameBytes.length, 28);
+        central.writeUInt16LE(0, 30);
+        central.writeUInt16LE(0, 32);
+        central.writeUInt16LE(0, 34);
+        central.writeUInt16LE(0, 36);
+        central.writeUInt32LE(0, 38);
+        central.writeUInt32LE(localOffset, 42);
+        centralParts.push(central, nameBytes);
+        localOffset += local.length + nameBytes.length + compressed.length;
+    }
+
+    const centralDirectory = Buffer.concat(centralParts);
+    const end = Buffer.alloc(22);
+    end.writeUInt32LE(0x06054b50, 0);
+    end.writeUInt16LE(0, 4);
+    end.writeUInt16LE(0, 6);
+    end.writeUInt16LE(Object.keys(files).length, 8);
+    end.writeUInt16LE(Object.keys(files).length, 10);
+    end.writeUInt32LE(centralDirectory.length, 12);
+    end.writeUInt32LE(localOffset, 16);
+    end.writeUInt16LE(0, 20);
+    return Buffer.concat([...localParts, centralDirectory, end]);
+}
 
 function createGame({
     english,
@@ -119,6 +243,13 @@ function createGame({
                         : match
                 );
             },
+            translate(key, defaultValue) {
+                const localization = sandbox.MyApp.libs.Localization;
+                if (localization.language === "English") return defaultValue;
+                return key && localization._data_index?.[key]
+                    ? localization._data_index[key]
+                    : defaultValue;
+            },
             alert(title, message, close) {
                 popups.push({ title, message });
                 if (autoClosePopups) close();
@@ -150,7 +281,11 @@ function createGame({
             intervals.delete(handle);
         },
         URL: class TestURL extends URL {},
-        Blob: undefined,
+        DOMParser: TestDOMParser,
+        TextDecoder,
+        Blob,
+        Response,
+        DecompressionStream,
         document: Object.assign(gameDocument, {
             head: Object.assign(gameDocument.head, {
                 appendChild(script) {
@@ -226,6 +361,59 @@ function sampleDictionaries() {
     };
 }
 
+function sampleGermanSheet() {
+    return {
+        name: "localization.csv",
+        text: async () => [
+            "Key,German",
+            '"General/Hello","Hallo {name}"',
+            '"General/Blank",""',
+            '"General/Missing","Missing {name}"',
+            '"General/Shared","Shared"',
+            '"Mission/Run","Lauf {player}"',
+            '"Mission/Extra","Extra"'
+        ].join("\n")
+    };
+}
+
+function sampleGermanXlsx() {
+    const bytes = makeZip({
+        "xl/workbook.xml": [
+            '<workbook xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">',
+            '<sheets><sheet name="General" sheetId="1" r:id="rId1"/></sheets></workbook>'
+        ].join(""),
+        "xl/_rels/workbook.xml.rels": [
+            '<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>'
+        ].join(""),
+        "xl/sharedStrings.xml": [
+            "<sst>",
+            "<si><t>Keys</t></si>",
+            "<si><t>English</t></si>",
+            "<si><t>Spanish</t></si>",
+            "<si><t>German</t></si>",
+            "<si><t>Hello</t></si>",
+            "<si><t>Hello</t></si>",
+            "<si><t>Hallo</t></si>",
+            "</sst>"
+        ].join(""),
+        "xl/worksheets/sheet1.xml": [
+            '<worksheet><sheetData>',
+            '<row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c>',
+            '<c r="C1" t="s"><v>2</v></c><c r="D1" t="s"><v>3</v></c></row>',
+            '<row r="2"><c r="A2" t="s"><v>5</v></c><c r="B2" t="s"><v>5</v></c>',
+            '<c r="C2"/><c r="D2" t="s"><v>6</v></c></row>',
+            "</sheetData></worksheet>"
+        ].join("")
+    }, 8);
+    return {
+        name: "localization.xlsx",
+        arrayBuffer: async () => bytes.buffer.slice(
+            bytes.byteOffset,
+            bytes.byteOffset + bytes.byteLength
+        )
+    };
+}
+
 test("audits baseline coverage, empty/unchanged text, placeholder contracts, and extra keys", async () => {
     const { english, german } = sampleDictionaries();
     const game = createGame({ english, german });
@@ -253,9 +441,73 @@ test("audits baseline coverage, empty/unchanged text, placeholder contracts, and
     assert.equal(report.auditStatus, "fail");
     assert.equal(report.warnings[0].key, "General/Shared");
     assert.equal(report.totalKeys, 6);
+    assert.equal(report.codeFetchAudit.status, "blocked");
+    assert.match(report.codeFetchAudit.error, /Upload a CSV or Excel/);
     assert.ok(report.nonTranslatedKeys.includes("General/Missing"));
     assert.ok(report.nonTranslatedKeys.includes("General/Blank"));
     assert.ok(report.nonTranslatedKeys.includes("General/Shared"));
+});
+
+test("loads an Excel workbook and compares keys from the selected language column", async () => {
+    const game = createGame({
+        english: { "General/Hello": "Hello" },
+        german: { "General/Hello": "Hallo" }
+    });
+    const loaded = await game.window.loadLocalizationSheet(sampleGermanXlsx(), "German");
+    const result = await game.window.runLocalizationCodeFetchTest("German");
+
+    assert.equal(loaded.worksheets, 1);
+    assert.equal(loaded.keys, 1);
+    assert.equal(result.status, "pass");
+    assert.equal(result.sheetFile, "localization.xlsx");
+    assert.equal(result.keysTested, 1);
+});
+
+test("tests every localization key through the game code-fetch API and restores localization state", async () => {
+    const { english, german } = sampleDictionaries();
+    const game = createGame({ english, german });
+    const localization = game.window.MyApp.libs.Localization;
+    const originalLanguage = localization.language;
+    const originalData = localization._data_index;
+    const translate = game.window.$$.translate;
+    await game.window.loadLocalizationSheet({
+        name: "translations.csv",
+        text: async () => 'Key,German\n"General/Hello","Hallo {name}"'
+    }, "German");
+    game.window.$$.translate = (key, fallback) =>
+        key === "General/Hello" ? "Wrong runtime value" : translate(key, fallback);
+
+    const report = await game.window.runLocalizationChecks("German", { quiet: true });
+
+    assert.equal(report.codeFetchAudit.status, "fail");
+    assert.equal(report.codeFetchAudit.keysTested, 1);
+    assert.deepEqual(
+        Array.from(report.codeFetchAudit.failures, failure => failure.key),
+        ["General/Hello"]
+    );
+    assert.equal(report.codeFetchAudit.comparisonSource, "uploaded-sheet");
+    assert.equal(report.codeFetchAudit.sheetFile, "translations.csv");
+    assert.equal(report.auditStatus, "fail");
+    assert.equal(localization.language, originalLanguage);
+    assert.equal(localization._data_index, originalData);
+});
+
+test("marks code-fetch coverage incomplete when the game's translation API is unavailable", async () => {
+    const game = createGame({
+        english: { "General/Hello": "Hello" },
+        german: { "General/Hello": "Hallo" }
+    });
+    await game.window.loadLocalizationSheet({
+        name: "translations.csv",
+        text: async () => 'Key,German\n"General/Hello","Hallo"'
+    }, "German");
+    delete game.window.$$.translate;
+
+    const report = await game.window.runLocalizationChecks("German", { quiet: true });
+
+    assert.equal(report.codeFetchAudit.status, "blocked");
+    assert.match(report.codeFetchAudit.error, /\$\$\.translate/);
+    assert.equal(report.auditStatus, "incomplete");
 });
 
 test("lists baseline and locale folder coverage and selects folders case-insensitively", async () => {
@@ -418,7 +670,7 @@ test("classifies only unchanged strings as manual review, not automated failure"
     });
     const report = await game.window.runLocalizationChecks("German", { quiet: true });
 
-    assert.equal(report.auditStatus, "review");
+    assert.equal(report.auditStatus, "incomplete");
     assert.equal(report.failed, 0);
     assert.equal(report.warningCount, 1);
     assert.equal(report.passed, 0);
@@ -434,6 +686,17 @@ test("provides an in-page QA panel and records popup verdicts from its controls"
     assert.equal(panel.id, "localization-qa-panel");
     assert.equal(controls.languageSelect.value, "German");
     assert.equal(game.intervals.size, 1);
+
+    assert.equal(controls.codeFetchButton.textContent, "Test code fetching");
+    controls.sheetInput.files = [sampleGermanSheet()];
+    await controls.sheetInput.listeners.change[0]();
+    assert.match(controls.status.textContent, /Loaded localization\.csv: 6 expected German keys/);
+    await controls.codeFetchButton.listeners.click[0]();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.match(
+        controls.status.textContent,
+        /Code-fetch PASS: 6\/6 keys passed, 0 failures \(localization\.csv\)/
+    );
 
     await controls.auditButton.listeners.click[0]();
     assert.equal(controls.folderSelect.options.length, 2);
