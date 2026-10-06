@@ -11,11 +11,18 @@ Thanks for helping improve these localization utilities. Keep changes focused on
 
 ## Verify changes
 
-There is no build or automated test suite in this repository. Verify changes in a permitted game/test environment:
+Run the dependency-free regression tests after changing the QA utility:
+
+```sh
+node --test localization-console-test.test.cjs
+```
+
+Then verify game-specific behavior in a permitted game/test environment:
 
 1. Load the changed script in the browser console after the game has initialized.
 2. Exercise the affected command with a known-good language and, where relevant, a supported alias/code.
 3. Confirm the report or popup content is correct, errors are actionable, and popup reviews restore the game's original language and dictionary.
 4. If changing popup review behavior, also verify that stopping a review closes the current popup and restores the original state.
+5. Confirm manual verdicts are recorded only when explicitly selected and that the exported JSON includes both automated findings and manual QA notes.
 
 Do not use a production client or data unless you are authorized to do so.

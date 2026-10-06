@@ -1,100 +1,100 @@
-# Game Localization Console Utilities
+# Game Localization QA Utilities
 
-Browser-console tools for checking a game's localization dictionary and reviewing translated text in the game's own popups. They are intended for localization testers and translators who can access the running game; they are not a standalone application or localization package.
+Browser-console tools for localization QA in the running game. They combine a dictionary audit with sequential in-game popup previews, manual QA verdicts, and a downloadable JSON report.
 
-## Choose a tool
+These scripts run inside the game's browser context; they are not a standalone app and cannot guarantee that a release has zero localization defects. The main script opens a separate QA window; automated checks catch dictionary and formatter issues, while testers review rendered text and record verdicts.
 
-| File | Use it for | What happens when loaded |
-| --- | --- | --- |
-| [`localization-console-test.js`](./localization-console-test.js) | Checking a language and reviewing untranslated or selected strings | Installs the commands below and runs a localization check |
-| [`Individual-Pop-up-per-Key.js`](./Individual-Pop-up-per-Key.js) | Quickly previewing one string | Installs `showLocalizationPopupForKey` and previews `General/LikeAppName` |
+## Tools
 
-Each file can be used on its own. For most review work, start with `localization-console-test.js`.
+| File | Purpose |
+| --- | --- |
+| [`localization-console-test.js`](./localization-console-test.js) | Main QA workflow: language selection, dictionary audit, folder/key popup review, manual verdicts, and report export |
+| [`Individual-Pop-up-per-Key.js`](./Individual-Pop-up-per-Key.js) | Quick preview of one localization key |
 
 ## Requirements
 
 - Open the game in a browser and wait for its application scripts to finish loading.
-- The page must expose `MyApp.libs.Localization`, `languageData`, `$$.formatStr`, and `$$.alert`.
-- The browser must be allowed to load the game's language scripts. When a dictionary is not already loaded, the tools request `app/resources/languages/lang_<LanguageName>.js` relative to the current game URL.
+- The game page must expose `MyApp.libs.Localization`, `languageData`, `$$.formatStr`, and `$$.alert`.
+- The page must be able to load its language scripts. A dictionary not already loaded is requested from `app/resources/languages/lang_<LanguageName>.js` relative to the current game URL.
+- Run these scripts only on the game or an authorized test environment.
 
-These scripts use the game's runtime and UI. Do not run them on an unrelated website.
-
-## Quick start
+## Quick start: recommended QA flow
 
 1. Open the game's browser developer console.
-2. (Optional) Choose the language before loading a utility:
+2. Paste the full contents of `localization-console-test.js`. It adds a persistent **Open Localization QA** button to the game page and tries to open the QA controls in a separate browser window. If the browser blocks the window, allow pop-ups for the game and click the launcher, or run `window.showLocalizationQAPanel()`.
+3. In the QA window, choose a supported language from **Language**. To verify the available choices in the console, use `window.listLocalizationLanguages()`. Do not assume a language exists: options depend on the game build.
+4. Click **Run audit**. For non-English languages, the utility attempts to load English as the baseline and reports missing/extra keys, empty/unchanged strings, placeholder mismatches, formatter errors, and any baseline-loading problem.
+5. Choose a folder from the **Folder** list and click **Review folder**. Use **Review all keys** or **Review flagged keys** for those workflows. The panel shows current key and progress as one game popup opens at a time.
+6. While the current popup is visible, use the panel's **Pass**, **Fail**, **Blocked**, or **Needs review** buttons. Add an optional QA note first if helpful. Recording a verdict does not close the game popup; close it to advance to the next key. Merely viewing or closing a popup does not mark it as passed.
+7. Click **QA summary** to see review coverage, or **Download report** to export the automated and manual results as JSON. Manual verdicts live in the current page session, so download the report before reloading or closing the game.
 
-   ```js
-   window.LOCALIZATION_TEST_LANGUAGE = "Hindi";
-   ```
+The separate QA window adapts to narrow/mobile screens with larger touch targets. On mobile browsers it may open as a separate tab. Keep the game page open while using the QA window because the localization APIs and review popups run in the game tab. The persistent game-page launcher can reopen the QA window at any time. **Hide window** closes only the QA window; it does not stop an active review or remove the launcher. **Stop review** closes the current review popup and restores the game's original language/dictionary. Reopen the QA window by clicking **Open Localization QA** or running `window.showLocalizationQAPanel()`. The console API remains available for scripted workflows.
 
-   Use a language name, display name, or code exposed by `MyApp.libs.Localization.availableLanguages`. If that list is unavailable, use the language dictionary/script name, such as `"English"`.
-3. Open the chosen JavaScript file in this repository, copy its full contents, and paste it into the console.
-4. Read the console output, or call the commands below to run a check or review popups.
+## Other review options
 
-The check utility uses Hindi by default if no language is configured. Change the default with `LOCALIZATION_TEST_LANGUAGE`, or provide a language directly to a command.
-
-## Check a language
-
-After loading `localization-console-test.js`, run:
-
-```js
-await window.runLocalizationChecks();          // Configured language
-await window.runLocalizationChecks("French"); // One-off language
-```
-
-The returned report is also available as `window.__localizationTestReport`. A successful setup returns `ready: true` and includes the language, key totals, missing and extra keys, empty and unchanged translations, placeholder mismatches, and failures. `passed` and `failed` count the English baseline keys when that dictionary is available; otherwise, they count the selected language's entries. If setup is blocked, the result has `ready: false` and an `error` message.
-
-When the English dictionary is available, the check compares key coverage and placeholder names against it. Without that baseline, it can still check that entries are strings and exercise the game's formatter, but it cannot reliably identify missing keys, untranslated English text, or placeholder-contract mismatches.
-
-## Review strings in game popups
-
-Review only strings that are empty or identical to the English text:
+Review only entries that are missing, empty (with a non-empty English fallback), or unchanged from English:
 
 ```js
 await window.showUntranslatedLocalizationPopups();
-await window.showUntranslatedLocalizationPopups("French");
 ```
 
-Review every key, or only specific keys:
+Review selected keys or every key in the selected language and English baseline:
 
 ```js
-await window.showLocalizationKeyPopups(); // Every key in the configured language
-await window.showLocalizationKeyPopups("French", ["General/LikeAppName"]);
-await window.showLocalizationKeyPopups("French", [
-  "General/LikeAppName",
-  "Another/Key"
+await window.showLocalizationKeyPopups(undefined, "General/Loading Msg");
+await window.showLocalizationKeyPopups(undefined, [
+  "General/Loading Msg",
+  "DynaConfMisc/User Properties"
 ]);
+await window.showLocalizationKeyPopups(); // All baseline and locale keys
 ```
 
-The all-keys review may open many popups. Close each popup to continue. Stop either kind of review at any time with:
+Review a folder once without changing the selected language:
 
 ```js
-window.stopLocalizationPopupReview();
+await window.showLocalizationFolderPopups("German", "DynaConfMisc");
 ```
 
-The review temporarily switches the game's active localization dictionary and restores its previous language and dictionary when it completes or is stopped. Popup reviews cannot show a key that is absent from the selected language dictionary.
+Run or repeat only the automated audit:
+
+```js
+const report = await window.runLocalizationChecks();
+report.failedKeys; // Keys with automated findings
+```
+
+Set a different default language at any time with `window.setLocalizationReviewLanguage("de")`. Popup review temporarily switches the game's localization dictionary and restores its previous language and dictionary when the review completes or is stopped.
+
+## Understanding results
+
+- **Missing:** present in the English baseline but absent from the selected language dictionary.
+- **Empty:** present but blank. It is an automated finding when the English value is non-empty, because the game may display its fallback.
+- **Unchanged:** non-empty selected-language text is identical to English. This is a manual-review warning, not an automated failure; product names or intentionally shared wording may be valid.
+- **Placeholder mismatch:** placeholder names differ from the English contract.
+- **Formatter failure:** the game's formatter threw, returned the wrong type, or left placeholders unresolved.
+- **Manual verdict:** the tester's visual/game-context result. It is separate from automated findings.
+
+For non-English reviews, the tool attempts to load English even when that dictionary was not already in memory. If it cannot load the baseline, the report includes the reason and its status is **INCOMPLETE** when no other failures were found; empty translations are still flagged for review. Missing/extra/unchanged comparisons cannot be conclusive without the baseline. Do not interpret an automated `PASS` as proof that translations are contextually correct, fit the UI, or have been visually verified. Use manual verdicts and the downloadable report as part of release QA.
 
 ## Preview one key
 
-Load `Individual-Pop-up-per-Key.js` to preview `General/LikeAppName` with sample values. To preview a different key, values, or language, call:
+Load `Individual-Pop-up-per-Key.js` for the default sample preview, or call:
 
 ```js
 await window.showLocalizationPopupForKey(
   "General/LikeAppName",
   { count: 12, name: "TestUser", crew_label: " +3 MERCS" },
-  "French"
+  "German"
 );
 ```
 
-For the default language and sample values, only the key is needed:
+The quick-preview script selects the game's current language when available; otherwise it uses the first game-supported language. Unsupported languages, unknown keys, missing game helpers, and loading errors are reported in the console.
 
-```js
-await window.showLocalizationPopupForKey("General/LikeAppName");
+## Contributing and validation
+
+See [`CONTRIBUTING.md`](./CONTRIBUTING.md). The main QA utility has a dependency-free Node.js smoke-test suite:
+
+```sh
+node --test localization-console-test.test.cjs
 ```
 
-Unknown keys, unsupported languages, missing game helpers, and language-loading errors are reported in the console. If a language cannot be loaded, confirm the language name and that the game's language-script URL is accessible.
-
-## Contributing
-
-See [`CONTRIBUTING.md`](./CONTRIBUTING.md) for change and manual verification guidance.
+The tests simulate the game's browser APIs; final verification of real game rendering still requires an authorized game/test environment.

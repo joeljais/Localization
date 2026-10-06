@@ -2,12 +2,25 @@
     "use strict";
 
     const defaultKey = "General/LikeAppName";
-    const defaultLanguage = window.LOCALIZATION_TEST_LANGUAGE || "Hindi";
     const defaultValues = {
         count: 12,
         name: "TestUser",
         crew_label: " +3 MERCS"
     };
+
+    function getDefaultLanguage() {
+        if (window.LOCALIZATION_TEST_LANGUAGE) return window.LOCALIZATION_TEST_LANGUAGE;
+
+        const localization = window.MyApp?.libs?.Localization;
+        const languages = Object.values(localization?.availableLanguages || {});
+        const current = localization?.language;
+        const languageInfo = languages.find(language =>
+            [language.name, language.displayName, language.code]
+                .some(value => typeof value === "string" &&
+                    value.toLowerCase() === String(current || "").toLowerCase())
+        );
+        return languageInfo?.name || languages[0]?.name || current || "Hindi";
+    }
 
     /**
      * Loads a game's language dictionary if needed, then displays one translated string.
@@ -17,10 +30,11 @@
         if (!localization) throw new Error("MyApp.libs.Localization is unavailable.");
 
         const languages = Object.values(localization.availableLanguages || {});
+        const normalizedLanguage = requestedLanguage.trim().toLowerCase();
         const languageInfo = languages.find(language =>
-            language.name === requestedLanguage ||
-            language.displayName === requestedLanguage ||
-            language.code === requestedLanguage
+            [language.name, language.displayName, language.code]
+                .some(value => typeof value === "string" &&
+                    value.trim().toLowerCase() === normalizedLanguage)
         );
         if (languages.length > 0 && !languageInfo) {
             throw new Error(
@@ -52,15 +66,19 @@
     window.showLocalizationPopupForKey = async function showLocalizationPopupForKey(
         key = defaultKey,
         sampleValues = defaultValues,
-        requestedLanguage = defaultLanguage
+        requestedLanguage = getDefaultLanguage()
     ) {
         const gameUi = window.$$;
         if (typeof gameUi?.formatStr !== "function" || typeof gameUi.alert !== "function") {
             console.error("[Localization popup] The game's formatter or alert is unavailable.");
             return false;
         }
-        if (typeof key !== "string") {
+        if (typeof key !== "string" || !key.trim()) {
             console.error("[Localization popup] The localization key must be a string.");
+            return false;
+        }
+        if (typeof requestedLanguage !== "string" || !requestedLanguage.trim()) {
+            console.error("[Localization popup] Provide a supported language name or code.");
             return false;
         }
 
